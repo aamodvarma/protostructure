@@ -17,7 +17,10 @@ from __future__ import annotations
 import warnings
 
 warnings.filterwarnings("ignore", category=UserWarning)
+import multiprocessing as mp
+import os
 import re
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass
 from functools import lru_cache
 from itertools import product as iproduct
@@ -737,20 +740,43 @@ def instantiate_template_lhs(
 # Script entry point
 # ---------------------------------------------------------------------------
 
+
+def _process_label(label: str, out_dir: str, seed: int = 123) -> str:
+    """Worker function: parse, instantiate, and write one CIF. Returns a status message."""
+    try:
+        template = parse_protostructure_label(label)
+        structure = instantiate_template_lhs(template, n_samples=20, seed=seed)
+    except Exception as exc:
+        return f"[FAIL] {label}: {exc}"
+    cif_filename = os.path.join(
+        out_dir,
+        f"{template.anon_formula}_{template.pearson}_{template.sg_num}_lhs.cif",
+    )
+    CifWriter(structure).write_file(cif_filename)
+    return f"[OK]   {label} → {cif_filename}"
+
+
 if __name__ == "__main__":
-    with open("./labels/labels-mixed-100k-volfixed.txt") as f:
-        for line in tqdm(f, desc="Generating structures (LHS)"):
-            label = line.strip()
-            print(f"Processing {label}...\n")
-            try:
-                template = parse_protostructure_label(label)
-                structure = instantiate_template_lhs(template, n_samples=20, seed=123)
-            except Exception as exc:
-                print(f"  → Failed: {exc}\n")
-                continue
-            cif_filename = (
-                f"./100k-volfixed/{template.anon_formula}_{template.pearson}"
-                f"_{template.sg_num}_lhs.cif"
-            )
-            CifWriter(structure).write_file(cif_filename)
-            print(f"  → Wrote {cif_filename}\n")
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Generate crystal structures from protostructure labels")
+    parser.add_argument("--input", default="./labels/labels-mixed-100k-volfixed.txt", help="Input labels file")
+    parser.add_argument("--outdir", default="./100k-volfixed", help="Output directory for CIF files")
+    parser.add_argument("--workers", type=int, default=mp.cpu_count(), help="Number of worker processes")
+    parser.add_argument("--seed", type=int, default=123, help="Random seed")
+    args = parser.parse_args()
+
+    os.makedirs(args.outdir, exist_ok=True)
+
+    with open(args.input) as f:
+        labels = [line.strip() for line in f if line.strip()]
+
+    print(f"Processing {len(labels)} labels with {args.workers} workers...")
+
+    with ProcessPoolExecutor(max_workers=args.workers) as pool:
+        futures = {
+            pool.submit(_process_label, label, args.outdir, args.seed): label
+            for label in labels
+        }
+        for future in tqdm(as_completed(futures), total=len(futures), desc="Generating structures"):
+            print(future.result())
