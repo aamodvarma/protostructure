@@ -1,2 +1,6 @@
 ./*.extxyz
 *.extxyz
+.claude/
+__pycache__/
+labels/
+
