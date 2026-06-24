@@ -1,0 +1,17 @@
+{
+  "permissions": {
+    "allow": [
+      "WebFetch(domain:www.aflow.org)",
+      "WebFetch(domain:pymatgen.org)",
+      "WebFetch(domain:github.com)",
+      "WebFetch(domain:spglib.readthedocs.io)",
+      "WebSearch",
+      "WebFetch(domain:rosenbrockc.github.io)",
+      "WebFetch(domain:arxiv.org)",
+      "Read(//home/ajrv/Downloads/temp_cifs_unitcell_2/**)",
+      "Bash(/home/ajrv/miniconda3/envs/pytorch_env/bin/python3 -)",
+      "Bash(grep -c \"^[0-9]*$\" /home/ajrv/Projects/research/fungLab/protostructures/cifs_lhs_random_volfixed_1_28k_unitcell.extxyz)",
+      "Bash(awk 'NR==1{n=$1+2; next} FNR==n{print; exit}' /home/ajrv/Projects/research/fungLab/protostructures/cifs_lhs_random_volfixed_1_28k_unitcell.extxyz)"
+    ]
+  }
+}
