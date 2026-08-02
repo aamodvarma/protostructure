@@ -1,2 +1,1 @@
-python3 enumerate_protostructures.py -n 100000 --random-elements --max-complexity 5 -o labels-mixed-100k-volfixed.txt
-
+/home/ajrv/.codex/sessions/2026/08/02/rollout-2026-08-02T12-54-18-019fc1ae-5edd-70d3-9eb3-7958b9d08416.jsonl

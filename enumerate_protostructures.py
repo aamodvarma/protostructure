@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Enumerate random ternary protostructure labels following the Aviary/AFLOW convention.
+"""Enumerate symmetry-distinct protostructure labels in Aviary/AFLOW format.
 
 Protostructure label format (Aviary convention):
     {anon_formula}_{pearson_symbol}_{spg_num}_{wyckoff_letters}:{el1}-{el2}-{el3}
@@ -17,7 +17,6 @@ import argparse
 import logging
 import multiprocessing as mp
 import random
-import periodictable
 import sys
 import time
 from collections import Counter
@@ -31,21 +30,31 @@ from pymatgen.analysis.prototypes import (
     RE_SUBST_ONE_PREFIX,
     RE_WYCKOFF,
     WYCKOFF_MULTIPLICITY_DICT,
+    WYCKOFF_POSITION_PARAM_DICT,
     canonicalize_element_wyckoffs,
 )
+from pymatgen.core import Element
 from pymatgen.symmetry.groups import SpaceGroup
 
 log = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Element pool: Z < 90, noble gases excluded
+# Element pools
 # ---------------------------------------------------------------------------
 
-# what mace is trained on
-l = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 89, 90, 91, 92, 93, 94]
-noble_gas = [2, 10, 18, 36, 54, 86, 118]
+_NOBLE_GAS_Z = {2, 10, 18, 36, 54, 86, 118}
 
-_ELEMENTS_POOL: list[str] = [periodictable.elements[i].symbol for i in l if i < 90 and i not in noble_gas] 
+# Broad default for synthetic-data generation. This preserves the original
+# H--Bi plus Ac range (the elements intended for the downstream potential)
+# while making the exclusions explicit.
+_ELEMENTS_POOL: list[str] = [
+    Element.from_Z(z).symbol for z in (*range(1, 84), 89) if z not in _NOBLE_GAS_Z
+]
+
+# Exact chemistry range used in arXiv:2601.21393.
+_PAPER_ELEMENTS_POOL: frozenset[str] = frozenset(
+    Element.from_Z(z).symbol for z in range(3, 36) if z not in _NOBLE_GAS_Z
+)
 
 # ---------------------------------------------------------------------------
 # Pre-computed space-group metadata
@@ -90,6 +99,7 @@ _SG_LIST: list[int] = list(_SG_TABLE)
 # Label-building helpers
 # ---------------------------------------------------------------------------
 
+
 def _wyckoff_str(letters: list[str] | tuple[str, ...]) -> str:
     """Build AFLOW-format Wyckoff string from a (possibly repeated) list of letters.
 
@@ -109,8 +119,7 @@ def _wyckoff_str(letters: list[str] | tuple[str, ...]) -> str:
 def _preprocess_ew(element_wyckoffs: str) -> str:
     """Add '1' prefix to bare Wyckoff letters so canonicalize_element_wyckoffs works.
 
-    Converts 'dg' → '1d1g', '2ab' → '2a1b', etc.
-    Applied per-element (underscore-separated) section.
+    Converts 'dg' → '1d1g', '2ab' → '2a1b', etc. Applied per-element (underscore-separated) section.
     """
     return "_".join(
         RE_WYCKOFF.sub(RE_SUBST_ONE_PREFIX, part)
@@ -156,6 +165,15 @@ def _make_label(
     mult = sg_data["mult"]
     prefix = sg_data["pearson_prefix"]
 
+    # A zero-DOF Wyckoff position is a unique fixed orbit and cannot be
+    # occupied more than once. Repeating a free Wyckoff position is valid:
+    # each occurrence has independent positional parameters.
+    all_letters = [letter for slot in wyck_slots for letter in slot]
+    letter_counts = Counter(all_letters)
+    free_params = WYCKOFF_POSITION_PARAM_DICT[str(sg)]
+    if any(letter_counts[ltr] > 1 and free_params[ltr] == 0 for ltr in letter_counts):
+        return None
+
     ew_raw = "_".join(_wyckoff_str(slot) for slot in wyck_slots)
     ew_pre = _preprocess_ew(ew_raw)
 
@@ -178,6 +196,7 @@ def _make_label(
 # Partition helpers
 # ---------------------------------------------------------------------------
 
+
 def _partitions_n(total: int, n: int) -> list[tuple[int, ...]]:
     """All ordered n-tuples of positive integers summing to total."""
     if n == 1:
@@ -193,12 +212,18 @@ def _partitions_n(total: int, n: int) -> list[tuple[int, ...]]:
 # Random sampling (primary mode)
 # ---------------------------------------------------------------------------
 
+
 def random_sample(
     elements: list[str] | None,
     n_samples: int,
     max_complexity: int = 5,
     seed: int | None = None,
     max_attempts_multiplier: int = 200,
+    min_elements: int = 2,
+    max_elements: int = 5,
+    min_atoms: int | None = None,
+    max_atoms: int | None = None,
+    element_pool: list[str] | None = None,
 ) -> list[str]:
     """Return a random subset of protostructure labels.
 
@@ -208,13 +233,19 @@ def random_sample(
     Args:
         elements: Element symbols to use for every sample.  Pass ``None`` to
             enable *random-elements mode*: each iteration independently draws a
-            count n ∈ {2, 3, 4, 5} uniformly at random, then samples n distinct
-            elements from the periodic-table pool (Z < 90, no noble gases).
+            element count uniformly from ``min_elements..max_elements``, then
+            samples distinct elements from ``element_pool``.
         n_samples: Number of unique protostructure labels to return.
         max_complexity: Maximum total Wyckoff sites across all elements
             (minimum equals the number of elements, one site each).
         seed: Random seed for reproducibility.
         max_attempts_multiplier: Stop after this multiple of n_samples attempts.
+        min_elements: Minimum component count in random-elements mode.
+        max_elements: Maximum component count in random-elements mode.
+        min_atoms: Optional inclusive lower bound on unit-cell atom count.
+        max_atoms: Optional inclusive upper bound on unit-cell atom count.
+        element_pool: Pool used in random-elements mode (default: H--Bi plus
+            Ac, excluding noble gases).
 
     Returns:
         Sorted list of unique protostructure label strings.
@@ -223,6 +254,16 @@ def random_sample(
     if elements is not None:
         _validate_elements(elements)
         fixed_elements = sorted(elements)
+
+    pool = _ELEMENTS_POOL if element_pool is None else list(element_pool)
+    if not 2 <= min_elements <= max_elements:
+        raise ValueError("Require 2 <= min_elements <= max_elements.")
+    if min_atoms is not None and min_atoms < 1:
+        raise ValueError("min_atoms must be positive.")
+    if max_atoms is not None and max_atoms < 1:
+        raise ValueError("max_atoms must be positive.")
+    if min_atoms is not None and max_atoms is not None and min_atoms > max_atoms:
+        raise ValueError("min_atoms cannot exceed max_atoms.")
 
     rng = random.Random(seed)
     labels: set[str] = set()
@@ -236,8 +277,11 @@ def random_sample(
         if fixed_elements is not None:
             sorted_els = fixed_elements
         else:
-            n_els = rng.randint(2, 5)
-            sorted_els = sorted(rng.sample(_ELEMENTS_POOL, n_els))
+            upper = min(max_elements, max_complexity, len(pool))
+            if min_elements > upper:
+                break
+            n_els = rng.randint(min_elements, upper)
+            sorted_els = sorted(rng.sample(pool, n_els))
 
         n_els = len(sorted_els)
         min_complexity = n_els  # at least one Wyckoff site per element
@@ -252,9 +296,13 @@ def random_sample(
         total_sites = rng.randint(min_complexity, max_complexity)
         partition = rng.choice(_partitions_n(total_sites, n_els))
 
-        wyck_slots = [
-            tuple(sorted(rng.choices(letters, k=k))) for k in partition
-        ]
+        wyck_slots = [tuple(sorted(rng.choices(letters, k=k))) for k in partition]
+
+        atom_count = sum(d["mult"][letter] for slot in wyck_slots for letter in slot)
+        if min_atoms is not None and atom_count < min_atoms:
+            continue
+        if max_atoms is not None and atom_count > max_atoms:
+            continue
 
         label = _make_label(sg, wyck_slots, sorted_els, d)
         if label is not None:
@@ -276,9 +324,10 @@ def random_sample(
 # Full enumeration (exhaustive)
 # ---------------------------------------------------------------------------
 
+
 def _enumerate_sg(args: tuple) -> list[str]:
     """Worker function: enumerate all labels for one space group."""
-    sg, sorted_els, max_complexity = args
+    sg, sorted_els, max_complexity, min_atoms, max_atoms = args
     if sg not in _SG_TABLE:
         return []
 
@@ -288,11 +337,19 @@ def _enumerate_sg(args: tuple) -> list[str]:
     results: set[str] = set()
 
     from itertools import product as iproduct
+
     for total_sites in range(n_els, max_complexity + 1):
         for partition in _partitions_n(total_sites, n_els):
-            for wyck_slots in iproduct(*[
-                combinations_with_replacement(letters, k) for k in partition
-            ]):
+            for wyck_slots in iproduct(
+                *[combinations_with_replacement(letters, k) for k in partition]
+            ):
+                atom_count = sum(
+                    d["mult"][letter] for slot in wyck_slots for letter in slot
+                )
+                if min_atoms is not None and atom_count < min_atoms:
+                    continue
+                if max_atoms is not None and atom_count > max_atoms:
+                    continue
                 label = _make_label(sg, list(wyck_slots), sorted_els, d)
                 if label is not None:
                     results.add(label)
@@ -305,14 +362,16 @@ def enumerate_all(
     max_complexity: int = 5,
     n_workers: int | None = None,
     show_progress: bool = True,
+    min_atoms: int | None = None,
+    max_atoms: int | None = None,
 ) -> list[str]:
-    """Exhaustively enumerate all ternary protostructure labels.
+    """Exhaustively enumerate all labels for one fixed chemical system.
 
     This is the full enumeration (~83M raw combinations across all 230 space
     groups for complexity 5).  Parallelized over space groups.
 
     Args:
-        elements: Exactly 3 distinct element symbols.
+        elements: Two or more distinct element symbols.
         max_complexity: Maximum Wyckoff sites across all 3 elements.
         n_workers: Number of parallel workers (default: all CPU cores).
         show_progress: Print progress to stderr.
@@ -326,7 +385,7 @@ def enumerate_all(
     if n_workers is None:
         n_workers = mp.cpu_count()
 
-    args = [(sg, sorted_els, max_complexity) for sg in _SG_LIST]
+    args = [(sg, sorted_els, max_complexity, min_atoms, max_atoms) for sg in _SG_LIST]
 
     if show_progress:
         print(
@@ -364,19 +423,27 @@ def enumerate_all(
 # Validation
 # ---------------------------------------------------------------------------
 
+
 def _validate_elements(elements: list[str]) -> None:
     if not (2 <= len(elements) <= 5):
         raise ValueError(f"Between 2 and 5 elements required, got {len(elements)}.")
     if len(set(elements)) != len(elements):
         raise ValueError(f"All elements must be distinct, got {elements}.")
     for el in elements:
-        if not el.isalpha():
+        try:
+            parsed = Element(el)
+        except (KeyError, ValueError):
             raise ValueError(f"Invalid element symbol: {el!r}")
+        if parsed.symbol != el:
+            raise ValueError(
+                f"Element symbols are case-sensitive; use {parsed.symbol!r}, not {el!r}."
+            )
 
 
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
+
 
 def _build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
@@ -387,36 +454,69 @@ def _build_parser() -> argparse.ArgumentParser:
         "elements",
         nargs="*",
         metavar="ELEMENT",
-        help="2–5 element symbols (e.g. Na Cl K).  Omit when --random-elements is used.",
+        help="2–5 element symbols (e.g. Na Cl K). Omit with --random-elements.",
     )
     p.add_argument(
         "--random-elements",
         action="store_true",
-        help="For each random sample, draw a count n ∈ {2,3,4,5} uniformly at random "
-             "then pick n distinct elements from the periodic table (Z < 90, no noble "
-             "gases).  Incompatible with positional ELEMENT arguments.",
+        help="Draw a random component count and distinct elements for each sample. "
+        "Incompatible with positional ELEMENT arguments.",
     )
     p.add_argument(
-        "-n", "--n-samples",
+        "-n",
+        "--n-samples",
         type=int,
         default=1000,
         metavar="N",
         help="Number of random protostructure labels to generate (default: 1000). "
-             "Ignored when --all is used.",
+        "Ignored when --all is used.",
     )
     p.add_argument(
         "--all",
         action="store_true",
         help="Perform full exhaustive enumeration instead of random sampling "
-             "(WARNING: slow, ~20 min for complexity 5).",
+        "(WARNING: slow, ~20 min for complexity 5).",
     )
     p.add_argument(
         "--max-complexity",
         type=int,
         default=5,
         metavar="C",
-        help="Maximum total Wyckoff sites across all 3 elements (default: 5). "
-             "Minimum is 3 (one per element).",
+        help="Maximum total occupied Wyckoff orbits (default: 5).",
+    )
+    p.add_argument(
+        "--min-elements",
+        type=int,
+        default=2,
+        metavar="K",
+        help="Minimum component count in random-elements mode (default: 2).",
+    )
+    p.add_argument(
+        "--max-elements",
+        type=int,
+        default=5,
+        metavar="K",
+        help="Maximum component count in random-elements mode (default: 5).",
+    )
+    p.add_argument(
+        "--min-atoms",
+        type=int,
+        default=None,
+        metavar="N",
+        help="Optional inclusive minimum unit-cell atom count.",
+    )
+    p.add_argument(
+        "--max-atoms",
+        type=int,
+        default=None,
+        metavar="N",
+        help="Optional inclusive maximum unit-cell atom count.",
+    )
+    p.add_argument(
+        "--paper-profile",
+        action="store_true",
+        help="Apply arXiv:2601.21393 enumeration bounds: binary/ternary, "
+        "Li--Br excluding noble gases, complexity <= 5, and <= 64 atoms.",
     )
     p.add_argument(
         "--seed",
@@ -433,12 +533,14 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Number of parallel workers for --all mode (default: all CPU cores).",
     )
     p.add_argument(
-        "-o", "--output",
+        "-o",
+        "--output",
         metavar="FILE",
         help="Output file path. If omitted, prints to stdout.",
     )
     p.add_argument(
-        "-v", "--verbose",
+        "-v",
+        "--verbose",
         action="store_true",
         help="Enable verbose logging.",
     )
@@ -455,13 +557,15 @@ def main(argv: list[str] | None = None) -> None:
     )
 
     if args.random_elements and args.elements:
-        print("HELO HOW ARE YOU")
-        print(args.elements)
-        parser.error("--random-elements and positional ELEMENT arguments are mutually exclusive.")
+        parser.error(
+            "--random-elements and positional ELEMENT arguments are mutually exclusive."
+        )
     if not args.random_elements and not args.elements:
         parser.error("Provide element symbols or use --random-elements.")
     if args.random_elements and args.all:
-        parser.error("--random-elements is not supported with --all (exhaustive enumeration requires fixed elements).")
+        parser.error(
+            "--random-elements is not supported with --all (exhaustive enumeration requires fixed elements)."
+        )
 
     elements = args.elements if args.elements else None
     if elements is not None:
@@ -473,12 +577,47 @@ def main(argv: list[str] | None = None) -> None:
     if args.max_complexity < 2:
         parser.error("--max-complexity must be at least 2.")
 
+    if not 2 <= args.min_elements <= args.max_elements <= 5:
+        parser.error("Require 2 <= --min-elements <= --max-elements <= 5.")
+    if args.min_atoms is not None and args.min_atoms < 1:
+        parser.error("--min-atoms must be positive.")
+    if args.max_atoms is not None and args.max_atoms < 1:
+        parser.error("--max-atoms must be positive.")
+    if (
+        args.min_atoms is not None
+        and args.max_atoms is not None
+        and args.min_atoms > args.max_atoms
+    ):
+        parser.error("--min-atoms cannot exceed --max-atoms.")
+
+    element_pool = None
+    if args.paper_profile:
+        if args.max_complexity > 5:
+            parser.error("--paper-profile requires --max-complexity <= 5.")
+        args.min_elements = 2
+        args.max_elements = 3
+        args.max_atoms = 64 if args.max_atoms is None else min(args.max_atoms, 64)
+        element_pool = sorted(_PAPER_ELEMENTS_POOL)
+        if elements is not None:
+            outside = sorted(set(elements) - _PAPER_ELEMENTS_POOL)
+            if outside:
+                parser.error(
+                    "--paper-profile only permits Li--Br excluding noble gases; "
+                    f"outside range: {outside}."
+                )
+            if len(elements) not in (2, 3):
+                parser.error("--paper-profile requires a binary or ternary system.")
+
     if args.all:
-        assert elements is not None  # guarded above: --random-elements+--all is rejected
+        assert (
+            elements is not None
+        )  # guarded above: --random-elements+--all is rejected
         labels = enumerate_all(
             elements,
             max_complexity=args.max_complexity,
             n_workers=args.workers,
+            min_atoms=args.min_atoms,
+            max_atoms=args.max_atoms,
         )
     else:
         if args.n_samples <= 0:
@@ -489,6 +628,11 @@ def main(argv: list[str] | None = None) -> None:
             n_samples=args.n_samples,
             max_complexity=args.max_complexity,
             seed=args.seed,
+            min_elements=args.min_elements,
+            max_elements=args.max_elements,
+            min_atoms=args.min_atoms,
+            max_atoms=args.max_atoms,
+            element_pool=element_pool,
         )
         log.info(
             "Generated %d unique labels in %.2fs",
