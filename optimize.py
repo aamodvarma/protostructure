@@ -115,6 +115,13 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Optional torch.compile mode. Benchmark before enabling.",
     )
     parser.add_argument(
+        "--max-neighbors",
+        type=int,
+        default=512,
+        help="Per-atom capacity for the fast NVIDIA neighbor list (default: 512). "
+        "Overflows automatically fall back to TorchSim's uncapped linked-cell list.",
+    )
+    parser.add_argument(
         "--positions-only",
         action="store_true",
         help="Relax atomic positions while keeping the generated cell fixed.",
@@ -153,6 +160,13 @@ def _parse_gpu_ids(value: str) -> list[str]:
 def _validate_args(
     args: argparse.Namespace, parser: argparse.ArgumentParser
 ) -> list[str]:
+    if sys.version_info < (3, 12):
+        parser.error(
+            "This batched TorchSim workflow requires Python 3.12 or newer; "
+            f"the active interpreter is Python {sys.version.split()[0]}. "
+            "Create a clean Python 3.12 environment before installing "
+            "torch-sim-atomistic, mace-torch, and cuEquivariance."
+        )
     try:
         gpu_ids = _parse_gpu_ids(args.gpus)
     except ValueError as exc:
@@ -167,6 +181,8 @@ def _validate_args(
         parser.error("--steps-between-swaps must be positive.")
     if args.steps_between_swaps > args.max_steps:
         parser.error("--steps-between-swaps cannot exceed --max-steps.")
+    if args.max_neighbors < 1:
+        parser.error("--max-neighbors must be positive.")
     if args.min_distance <= 0:
         parser.error("--min-distance must be positive.")
     if not args.input.is_dir():
@@ -195,6 +211,7 @@ def _run_config(args: argparse.Namespace, n_workers: int) -> dict[str, Any]:
         "dtype": args.dtype,
         "cueq": not args.no_cueq,
         "compile_mode": args.compile_mode,
+        "max_neighbors": args.max_neighbors,
         "positions_only": args.positions_only,
         "min_distance": args.min_distance,
         "only_converged": args.only_converged,
@@ -211,6 +228,14 @@ def _prepare_manifests(args: argparse.Namespace, n_workers: int) -> list[list[st
 
     if config_path.exists():
         existing_config = json.loads(config_path.read_text())
+        # Neighbor capacity changes allocation only; completed calculations that did
+        # not overflow remain equivalent, so older runs are safe to resume.
+        if "max_neighbors" not in existing_config:
+            existing_config["max_neighbors"] = args.max_neighbors
+            _atomic_write_text(
+                config_path,
+                json.dumps(existing_config, indent=2, sort_keys=True) + "\n",
+            )
         if existing_config != requested_config:
             raise RuntimeError(
                 "The output directory contains a run with different settings. "
@@ -536,6 +561,92 @@ def _write_chunk(
     _atomic_write_text(done_path, json.dumps(done, indent=2, sort_keys=True) + "\n")
 
 
+def _make_neighbor_list(max_neighbors: int) -> Any:
+    """Build a fast bounded neighbor list with an uncapped overflow fallback."""
+    import torch
+    from nvalchemiops.neighbors.neighbor_utils import NeighborOverflowError
+    from nvalchemiops.torch.neighbors import batch_naive_neighbor_list
+    from torch_sim.neighbors import torch_nl_linked_cell
+    from torch_sim.neighbors.utils import normalize_inputs
+
+    warned_about_overflow = False
+
+    def neighbor_list(
+        positions: Any,
+        cell: Any,
+        pbc: Any,
+        cutoff: float,
+        system_idx: Any,
+        self_interaction: bool = False,
+    ) -> tuple[Any, Any, Any]:
+        nonlocal warned_about_overflow
+        n_systems = int(system_idx.max().item()) + 1
+        normalized_cell, normalized_pbc = normalize_inputs(cell, pbc, n_systems)
+        try:
+            result = batch_naive_neighbor_list(
+                positions=positions,
+                cutoff=cutoff,
+                batch_idx=system_idx.to(torch.int32),
+                cell=normalized_cell,
+                pbc=normalized_pbc.to(torch.bool),
+                max_neighbors=max_neighbors,
+                return_neighbor_list=True,
+            )
+        except NeighborOverflowError as exc:
+            if not warned_about_overflow:
+                print(
+                    "Neighbor capacity exceeded "
+                    f"({exc.num_neighbors} > {exc.max_neighbors}); using the "
+                    "uncapped TorchSim linked-cell neighbor list for dense states.",
+                    flush=True,
+                )
+                warned_about_overflow = True
+            return torch_nl_linked_cell(
+                positions,
+                normalized_cell,
+                normalized_pbc,
+                cutoff,
+                system_idx,
+                self_interaction,
+            )
+
+        mapping = result[0].to(dtype=torch.long)
+        if len(result) == 3:
+            shifts_idx = result[2].to(dtype=normalized_cell.dtype)
+        else:
+            shifts_idx = torch.zeros(
+                (mapping.shape[1], 3),
+                dtype=normalized_cell.dtype,
+                device=positions.device,
+            )
+        system_mapping = system_idx[mapping[0]]
+
+        if self_interaction:
+            n_atoms = positions.shape[0]
+            atom_indices = torch.arange(
+                n_atoms, device=positions.device, dtype=torch.long
+            )
+            mapping = torch.cat(
+                (mapping, torch.stack((atom_indices, atom_indices))), dim=1
+            )
+            shifts_idx = torch.cat(
+                (
+                    shifts_idx,
+                    torch.zeros(
+                        (n_atoms, 3),
+                        dtype=normalized_cell.dtype,
+                        device=positions.device,
+                    ),
+                ),
+                dim=0,
+            )
+            system_mapping = torch.cat((system_mapping, system_idx), dim=0)
+
+        return mapping, system_mapping, shifts_idx
+
+    return neighbor_list
+
+
 def _worker(
     worker_index: int,
     physical_gpu: str,
@@ -572,6 +683,7 @@ def _worker(
             model=model_path,
             device=torch.device("cuda"),
             dtype=dtype,
+            neighbor_list_fn=_make_neighbor_list(args.max_neighbors),
             compute_forces=True,
             compute_stress=not args.positions_only,
             enable_cueq=not args.no_cueq,
